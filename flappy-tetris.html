@@ -36,7 +36,7 @@
     <span>Score: <b id="scoreEl">0</b></span>
     <span>Level: <b id="levelEl">1</b></span>
   </div>
-  <div id="controls">SPACE kısa = 1 kare yukarı + döndür &nbsp;·&nbsp; SPACE basılı tut = gölgeye indir &nbsp;·&nbsp; ↓ = anında indir</div>
+  <div id="controls">SPACE basılı tut = yukarı çık + döndür &nbsp;·&nbsp; SPACE bırak = düş &nbsp;·&nbsp; tekrar SPACE = gölgeye yerleş</div>
 
   <script>
   const canvas = document.getElementById('gameCanvas');
@@ -47,9 +47,8 @@
   const VIS_COLS    = 10;
   const ROWS        = 20;
   const WORLD_COLS  = VIS_COLS;
-  const GRAVITY     = 0.22;
   const BASE_SCROLL = 0.6;
-  const HOLD_MS     = 220;   // ms until Space "hold" triggers hard-drop
+  const STEP_MS     = 500;   // ms per cell (both rise and fall)
 
   canvas.width  = VIS_COLS * B;   // 300
   canvas.height = ROWS * B;       // 600
@@ -92,14 +91,16 @@
   let world;
   let scrollX;
   let scrollSpeed;
-  let piece;       // { shape, color, pixelY, vy }
+  let piece;       // { shape, color, pixelY }
   let pieceSC;     // piece screen column
   let score, level, animFrame, gameState;
   let clearAnim;   // null | { rows, timer }
 
-  // Space hold tracking
-  let spaceHoldTimer = null;
-  let spaceDown      = false;
+  // Step-based movement intervals
+  let holdInterval = null;   // rise interval (space held)
+  let fallInterval = null;   // fall interval (space released)
+  let spaceDown    = false;
+  let hasRisen     = false;  // true after piece has risen at least once (enables lock-on-press)
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   function rotateCW(s) {
@@ -137,12 +138,13 @@
   }
 
   function spawnPiece() {
+    hasRisen = false;
     const t    = TETROS[Math.floor(Math.random() * TETROS.length)];
     const rots = Math.floor(Math.random() * 4);
     let s = t.shape.map(r => [...r]);
     for (let i = 0; i < rots; i++) s = rotateCW(s);
     pieceSC = Math.floor((VIS_COLS - s[0].length) / 2);
-    return { shape: s, color: t.color, pixelY: -B * (s.length + 2), vy: 1 };
+    return { shape: s, color: t.color, pixelY: 0 };
   }
 
   function lockPiece() {
@@ -156,7 +158,7 @@
           world[toWC(pieceSC + dx)][row] = piece.color;
         if (row >= 0 && row <= 2) tooHigh = true;
       }
-    if (tooHigh) { gameState = 'gameover'; return; }
+    if (tooHigh) { stopFalling(); stopRising(); gameState = 'gameover'; return; }
 
     // Check full rows
     const fullRows = [];
@@ -177,6 +179,7 @@
       score += 10;
       updateHUD();
       piece = spawnPiece();
+      startFalling();
     }
   }
 
@@ -225,6 +228,7 @@
         clearFullRows(clearAnim.rows);
         clearAnim = null;
         piece = spawnPiece();
+        startFalling();
       }
       return;
     }
@@ -240,25 +244,9 @@
 
     if (animFrame % 60 === 0) { score++; updateHUD(); }
 
-    piece.vy += GRAVITY;
-    const nextY = piece.pixelY + piece.vy;
-
-    if (collides(piece.shape, nextY)) {
-      while (!collides(piece.shape, piece.pixelY + 1) && piece.pixelY < ROWS * B)
-        piece.pixelY++;
-      piece.vy = 0;
-      lockPiece();
-      return;
-    } else {
-      piece.pixelY = nextY;
-    }
-
-    if (piece.vy < 0 && piece.pixelY < -piece.shape.length * B * 5) {
-      piece.pixelY = -piece.shape.length * B * 5;
-      piece.vy     = 0;
-    }
-
+    // Scroll-based collision: world moved into piece's current position
     if (piece.pixelY + piece.shape.length * B > 0 && collides(piece.shape, piece.pixelY)) {
+      stopFalling(); stopRising();
       gameState = 'gameover';
     }
   }
@@ -358,8 +346,9 @@
 
     if (gameState === 'start')
       drawOverlay('FLAPPY TETRIS',
-        ['SPACE kısa bas = 1 kare yukarı + döndür',
-         'SPACE basılı tut = gölgeye indir',
+        ['SPACE basılı tut = her 0.5sn\'de 1 yukarı + döndür',
+         'SPACE bırak = her 0.5sn\'de 1 aşağı düş',
+         'Tekrar SPACE = gölgeye anında yerleş',
          '↓ = Anında aşağı indir',
          '',
          'Zemin sola kayar ve döner!',
@@ -409,60 +398,79 @@
   function loop() { update(); draw(); requestAnimationFrame(loop); }
 
   // ── Input ──────────────────────────────────────────────────────────────────
-  function startGame() { init(); gameState = 'playing'; }
+  function startGame() { init(); gameState = 'playing'; startFalling(); }
 
-  function tapUp() {
-    // Move 1 block up + rotate
-    if (gameState !== 'playing' || clearAnim) return;
-    piece.pixelY -= B;
-    piece.vy      = 0;
-    piece.shape   = rotateCW(piece.shape);
-    const maxSC = VIS_COLS - piece.shape[0].length;
-    if (pieceSC > maxSC) pieceSC = maxSC;
-    if (pieceSC < 0)     pieceSC = 0;
+  function startFalling() {
+    stopFalling();
+    fallInterval = setInterval(() => {
+      if (gameState !== 'playing' || clearAnim) return;
+      if (!collides(piece.shape, piece.pixelY + B)) {
+        piece.pixelY += B;
+      } else {
+        stopFalling();
+        lockPiece();
+      }
+    }, STEP_MS);
+  }
+
+  function stopFalling() {
+    if (fallInterval) { clearInterval(fallInterval); fallInterval = null; }
+  }
+
+  function startRising() {
+    stopRising();
+    holdInterval = setInterval(() => {
+      if (gameState !== 'playing' || clearAnim) return;
+      hasRisen = true;
+      piece.shape = rotateCW(piece.shape);
+      const maxSC = VIS_COLS - piece.shape[0].length;
+      if (pieceSC > maxSC) pieceSC = maxSC;
+      if (pieceSC < 0) pieceSC = 0;
+      piece.pixelY -= B;
+    }, STEP_MS);
+  }
+
+  function stopRising() {
+    if (holdInterval) { clearInterval(holdInterval); holdInterval = null; }
   }
 
   function hardDrop() {
     if (gameState !== 'playing' || clearAnim) return;
-    // Drop to current ghost position
+    stopFalling(); stopRising();
     piece.pixelY = ghostY();
-    piece.vy     = 0;
     lockPiece();
   }
 
-  // Space: short press = 1 up + rotate, hold = hard drop to ghost
+  // Space held → rise every 500ms; released → fall every 500ms
+  // Tap space while falling (after having risen at least once) → lock at ghost
   function onSpaceDown() {
     if (gameState !== 'playing') { startGame(); return; }
     if (spaceDown) return;
     spaceDown = true;
-    tapUp();
-    spaceHoldTimer = setTimeout(() => {
-      spaceHoldTimer = null;
+    if (fallInterval && hasRisen) {
+      // Second press while falling: lock immediately
       hardDrop();
-    }, HOLD_MS);
+    } else {
+      // First press: switch to rising
+      stopFalling();
+      startRising();
+    }
   }
 
   function onSpaceUp() {
+    if (!spaceDown) return;
     spaceDown = false;
-    if (spaceHoldTimer !== null) {
-      clearTimeout(spaceHoldTimer);
-      spaceHoldTimer = null;
-      // Short tap: piece already moved up, let gravity handle the rest
-    }
+    stopRising();
+    if (gameState === 'playing') startFalling();
   }
 
   function clickAction() {
     if (gameState !== 'playing') { startGame(); return; }
-    if (clearAnim) return;
-    // Click = jump 2 blocks up
-    piece.pixelY -= 2 * B;
-    piece.vy = 0;
   }
 
   document.addEventListener('keydown', e => {
     if (e.key === ' ')         { e.preventDefault(); onSpaceDown(); }
     if (e.key === 'ArrowDown') { e.preventDefault(); hardDrop(); }
-    if (e.key === 'ArrowUp')   { e.preventDefault(); tapUp(); }
   });
 
   document.addEventListener('keyup', e => {
