@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flappy Tetris</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d1117;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      min-height: 100vh;
+      font-family: 'Courier New', monospace;
+      color: #fff; user-select: none;
+    }
+    #title {
+      font-size: 2.2em; font-weight: bold; letter-spacing: 5px;
+      background: linear-gradient(90deg, #00cfff, #ff6b35);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text; margin-bottom: 12px;
+    }
+    canvas {
+      border: 2px solid #30363d; border-radius: 4px; display: block; cursor: pointer;
+      box-shadow: 0 0 40px rgba(0,207,255,0.15), 0 0 80px rgba(0,0,0,0.5);
+    }
+    #hud { display: flex; gap: 40px; margin-top: 12px; font-size: 1em; color: #8b949e; }
+    #hud b { color: #00cfff; }
+    #controls { margin-top: 6px; font-size: 0.72em; color: #484f58; text-align: center; letter-spacing: 1px; }
+  </style>
+</head>
+<body>
+  <div id="title">FLAPPY TETRIS</div>
+  <canvas id="gameCanvas"></canvas>
+  <div id="hud">
+    <span>Score: <b id="scoreEl">0</b></span>
+    <span>Level: <b id="levelEl">1</b></span>
+  </div>
+  <div id="controls">SPACE / CLICK = Flap up + Rotate &nbsp;·&nbsp; Floor scrolls left &amp; wraps around!</div>
+
+  <script>
+  const canvas = document.getElementById('gameCanvas');
+  const ctx    = canvas.getContext('2d');
+
+  // ── Constants ──────────────────────────────────────────────────────────────
+  const B           = 30;          // block size px
+  const VIS_COLS    = 16;          // visible columns
+  const ROWS        = 20;          // visible rows
+  const WORLD_COLS  = 80;          // circular world width (columns)
+  const GRAVITY     = 0.22;
+  const FLAP_V      = -6.2;
+  const BASE_SCROLL = 0.6;         // px/frame at level 1
+  const PIECE_COL   = 4;           // fixed screen column for active piece
+
+  canvas.width  = VIS_COLS * B;    // 480
+  canvas.height = ROWS * B;        // 600
+
+  // ── Tetrominos ─────────────────────────────────────────────────────────────
+  const TETROS = [
+    { shape: [[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]], color: '#00cfff' },
+    { shape: [[1,1],[1,1]],                               color: '#ffd700' },
+    { shape: [[0,1,0],[1,1,1],[0,0,0]],                   color: '#bf5fff' },
+    { shape: [[0,1,1],[1,1,0],[0,0,0]],                   color: '#00e676' },
+    { shape: [[1,1,0],[0,1,1],[0,0,0]],                   color: '#ff1744' },
+    { shape: [[1,0,0],[1,1,1],[0,0,0]],                   color: '#448aff' },
+    { shape: [[0,0,1],[1,1,1],[0,0,0]],                   color: '#ff6d00' },
+  ];
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let world;       // world[wc][row] = color string | null
+  let scrollX;     // total pixels scrolled (0 .. WORLD_COLS*B, wraps)
+  let scrollSpeed;
+  let piece;       // { shape, color, pixelY, vy }
+  let score, level, animFrame, gameState;
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function rotateCW(s) {
+    const R = s.length, C = s[0].length;
+    const out = Array.from({length: C}, () => new Array(R).fill(0));
+    for (let y = 0; y < R; y++)
+      for (let x = 0; x < C; x++)
+        out[x][R-1-y] = s[y][x];
+    return out;
+  }
+
+  // Screen column → world column given current scrollX
+  function toWC(sc) {
+    const colOff = Math.floor(scrollX / B) % WORLD_COLS;
+    return ((colOff + sc) % WORLD_COLS + WORLD_COLS) % WORLD_COLS;
+  }
+
+  // Does piece shape at given pixelY collide with world blocks or the floor?
+  function collides(shape, pixelY) {
+    for (let dy = 0; dy < shape.length; dy++)
+      for (let dx = 0; dx < shape[0].length; dx++) {
+        if (!shape[dy][dx]) continue;
+        const row = Math.floor((pixelY + dy * B) / B);
+        if (row >= ROWS) return true;        // below canvas
+        if (row < 0)     continue;           // above canvas – skip
+        if (world[toWC(PIECE_COL + dx)][row]) return true;
+      }
+    return false;
+  }
+
+  function spawnPiece() {
+    const t    = TETROS[Math.floor(Math.random() * TETROS.length)];
+    const rots = Math.floor(Math.random() * 4);
+    let s = t.shape.map(r => [...r]);
+    for (let i = 0; i < rots; i++) s = rotateCW(s);
+    return { shape: s, color: t.color, pixelY: -B * (s.length + 2), vy: 1 };
+  }
+
+  function lockPiece() {
+    const sh = piece.shape;
+    let tooHigh = false;
+    for (let dy = 0; dy < sh.length; dy++)
+      for (let dx = 0; dx < sh[0].length; dx++) {
+        if (!sh[dy][dx]) continue;
+        const row = Math.floor((piece.pixelY + dy * B) / B);
+        if (row >= 0 && row < ROWS)
+          world[toWC(PIECE_COL + dx)][row] = piece.color;
+        if (row >= 0 && row <= 2) tooHigh = true;  // landed too high
+      }
+    score += 10;
+    updateHUD();
+    if (tooHigh) { gameState = 'gameover'; return; }
+    piece = spawnPiece();
+  }
+
+  function initWorld() {
+    world = Array.from({length: WORLD_COLS}, () => new Array(ROWS).fill(null));
+    // Solid ground at the bottom row
+    for (let c = 0; c < WORLD_COLS; c++) world[c][ROWS-1] = '#1e3020';
+  }
+
+  function init() {
+    initWorld();
+    scrollX     = 0;
+    scrollSpeed = BASE_SCROLL;
+    score       = 0;
+    level       = 1;
+    animFrame   = 0;
+    piece       = spawnPiece();
+    gameState   = 'start';
+    updateHUD();
+  }
+
+  function updateHUD() {
+    document.getElementById('scoreEl').textContent = score;
+    document.getElementById('levelEl').textContent = level;
+  }
+
+  // ── Update ─────────────────────────────────────────────────────────────────
+  function update() {
+    if (gameState !== 'playing') return;
+    animFrame++;
+
+    // Scroll world left (wraps)
+    scrollX = (scrollX + scrollSpeed) % (WORLD_COLS * B);
+
+    // Difficulty ramp
+    const newLvl = 1 + Math.floor(score / 150);
+    if (newLvl !== level) {
+      level       = newLvl;
+      scrollSpeed = BASE_SCROLL + (level - 1) * 0.12;
+      updateHUD();
+    }
+
+    // Score trickle
+    if (animFrame % 60 === 0) { score++; updateHUD(); }
+
+    // Piece physics
+    piece.vy += GRAVITY;
+    const nextY = piece.pixelY + piece.vy;
+
+    if (collides(piece.shape, nextY)) {
+      // Find exact landing position (step down 1 px at a time from current Y)
+      while (!collides(piece.shape, piece.pixelY + 1) && piece.pixelY < ROWS * B)
+        piece.pixelY++;
+      piece.vy = 0;
+      lockPiece();
+    } else {
+      piece.pixelY = nextY;
+    }
+
+    // Ceiling clamp (prevent flying too far above screen)
+    if (piece.vy < 0 && piece.pixelY < -piece.shape.length * B * 5) {
+      piece.pixelY = -piece.shape.length * B * 5;
+      piece.vy     = 0;
+    }
+
+    // Detect if scrolling floor moved a block into the active piece
+    if (gameState === 'playing'
+        && piece.pixelY + piece.shape.length * B > 0
+        && collides(piece.shape, piece.pixelY)) {
+      gameState = 'gameover';
+    }
+  }
+
+  // ── Draw ───────────────────────────────────────────────────────────────────
+  function drawBlock(x, y, color, alpha) {
+    ctx.globalAlpha = alpha ?? 1;
+    ctx.fillStyle   = color;
+    ctx.fillRect(x+1, y+1, B-2, B-2);
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(x+1, y+1, B-2, 3);
+    ctx.fillRect(x+1, y+1, 3, B-2);
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(x+1, y+B-4, B-2, 3);
+    ctx.fillRect(x+B-4, y+1, 3, B-2);
+    ctx.globalAlpha = 1;
+  }
+
+  function panelRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.lineTo(x+w-r, y);
+    ctx.arcTo(x+w, y,   x+w, y+r,   r);
+    ctx.lineTo(x+w, y+h-r);
+    ctx.arcTo(x+w, y+h, x+w-r, y+h, r);
+    ctx.lineTo(x+r, y+h);
+    ctx.arcTo(x, y+h,   x, y+h-r,   r);
+    ctx.lineTo(x, y+r);
+    ctx.arcTo(x, y,     x+r, y,     r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    // Background
+    const bg = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    bg.addColorStop(0, '#080b10');
+    bg.addColorStop(1, '#0f1620');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+    ctx.lineWidth = 1;
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < VIS_COLS; c++)
+        ctx.strokeRect(c*B, r*B, B, B);
+
+    // ── Scrolling world floor ──
+    const pixOff = scrollX % B;
+    const colOff = Math.floor(scrollX / B) % WORLD_COLS;
+    for (let sc = -1; sc <= VIS_COLS; sc++) {
+      const wc = ((colOff + sc) % WORLD_COLS + WORLD_COLS) % WORLD_COLS;
+      const sx = sc * B - pixOff;
+      if (sx > canvas.width + B || sx < -B) continue;
+      for (let row = 0; row < ROWS; row++)
+        if (world[wc][row]) drawBlock(sx, row * B, world[wc][row]);
+    }
+
+    // ── Ghost (landing preview) ──
+    if (gameState === 'playing' && piece && piece.pixelY + piece.shape.length * B > 0) {
+      let ghostY = piece.pixelY;
+      while (!collides(piece.shape, ghostY + 1) && ghostY < ROWS * B) ghostY++;
+      const px = PIECE_COL * B;
+      for (let dy = 0; dy < piece.shape.length; dy++)
+        for (let dx = 0; dx < piece.shape[0].length; dx++)
+          if (piece.shape[dy][dx])
+            drawBlock(px + dx*B, ghostY + dy*B, piece.color, 0.18);
+    }
+
+    // ── Active piece ──
+    if (gameState !== 'start' && piece) {
+      const px = PIECE_COL * B;
+      // Glow halo
+      ctx.save();
+      ctx.shadowColor = piece.color;
+      ctx.shadowBlur  = 14;
+      for (let dy = 0; dy < piece.shape.length; dy++)
+        for (let dx = 0; dx < piece.shape[0].length; dx++)
+          if (piece.shape[dy][dx]) {
+            ctx.fillStyle   = piece.color + '55';
+            ctx.fillRect(px + dx*B + 1, piece.pixelY + dy*B + 1, B-2, B-2);
+          }
+      ctx.restore();
+      // Solid blocks
+      for (let dy = 0; dy < piece.shape.length; dy++)
+        for (let dx = 0; dx < piece.shape[0].length; dx++)
+          if (piece.shape[dy][dx])
+            drawBlock(px + dx*B, piece.pixelY + dy*B, piece.color);
+    }
+
+    // ── Scroll direction arrow ──
+    if (gameState === 'playing') {
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.font      = "11px 'Courier New'";
+      ctx.textAlign = 'right';
+      ctx.fillText('◀ scroll', canvas.width - 6, 14);
+    }
+
+    // ── Overlays ──
+    if (gameState === 'start')
+      drawOverlay('FLAPPY TETRIS',
+        ['A Tetris piece falls from above.',
+         '',
+         'SPACE = Flap up + Rotate piece',
+         'Without SPACE it falls straight down.',
+         '',
+         'The floor scrolls LEFT continuously',
+         'and wraps around (360°).',
+         '',
+         'Survive as long as you can!'],
+        '[ SPACE or CLICK to start ]', '#00cfff');
+
+    if (gameState === 'gameover')
+      drawOverlay('GAME OVER',
+        [`Score:  ${score}`, `Level:  ${level}`],
+        '[ SPACE or CLICK to restart ]', '#ff1744');
+  }
+
+  function drawOverlay(title, lines, hint, titleColor) {
+    ctx.fillStyle = 'rgba(8,11,16,0.86)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const pw = 320, ph = lines.length * 22 + 160;
+    const px = (canvas.width  - pw) / 2;
+    const py = canvas.height  / 2 - ph / 2;
+
+    ctx.fillStyle   = 'rgba(16,22,30,0.97)';
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth   = 1.5;
+    panelRect(px, py, pw, ph, 10);
+    ctx.fill(); ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.font      = "bold 26px 'Courier New'";
+    ctx.fillStyle = titleColor;
+    ctx.fillText(title, canvas.width / 2, py + 46);
+
+    ctx.font      = "12px 'Courier New'";
+    ctx.fillStyle = '#8b949e';
+    lines.forEach((l, i) => ctx.fillText(l, canvas.width / 2, py + 84 + i * 22));
+
+    if (Math.floor(Date.now() / 500) % 2 === 0) {
+      ctx.font      = "bold 12px 'Courier New'";
+      ctx.fillStyle = '#fdd835';
+      ctx.fillText(hint, canvas.width / 2, py + ph - 20);
+    }
+  }
+
+  // ── Loop ───────────────────────────────────────────────────────────────────
+  function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+  // ── Input ──────────────────────────────────────────────────────────────────
+  function flap() {
+    if (gameState === 'playing') {
+      piece.vy    = FLAP_V;
+      piece.shape = rotateCW(piece.shape);
+    } else {
+      init();
+      gameState = 'playing';
+    }
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === ' ') { e.preventDefault(); flap(); }
+  });
+  canvas.addEventListener('click', flap);
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault(); flap();
+  }, { passive: false });
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+  init();
+  loop();
+  </script>
+</body>
+</html>
