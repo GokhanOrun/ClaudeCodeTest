@@ -36,24 +36,46 @@
     <span>Score: <b id="scoreEl">0</b></span>
     <span>Level: <b id="levelEl">1</b></span>
   </div>
-  <div id="controls">SPACE / CLICK = Flap up + Rotate &nbsp;·&nbsp; Floor scrolls left &amp; wraps around!</div>
+  <div id="controls">SPACE kısa = 1 kare yukarı + döndür &nbsp;·&nbsp; SPACE basılı tut = gölgeye indir &nbsp;·&nbsp; ↓ = anında indir</div>
 
   <script>
   const canvas = document.getElementById('gameCanvas');
   const ctx    = canvas.getContext('2d');
 
   // ── Constants ──────────────────────────────────────────────────────────────
-  const B           = 30;          // block size px
-  const VIS_COLS    = 16;          // visible columns
-  const ROWS        = 20;          // visible rows
-  const WORLD_COLS  = 80;          // circular world width (columns)
+  const B           = 30;
+  const VIS_COLS    = 10;
+  const ROWS        = 20;
+  const WORLD_COLS  = VIS_COLS;
   const GRAVITY     = 0.22;
-  const FLAP_V      = -6.2;
-  const BASE_SCROLL = 0.6;         // px/frame at level 1
-  const PIECE_COL   = 4;           // fixed screen column for active piece
+  const BASE_SCROLL = 0.6;
+  const HOLD_MS     = 220;   // ms until Space "hold" triggers hard-drop
 
-  canvas.width  = VIS_COLS * B;    // 480
-  canvas.height = ROWS * B;        // 600
+  canvas.width  = VIS_COLS * B;   // 300
+  canvas.height = ROWS * B;       // 600
+
+  // ── Audio ──────────────────────────────────────────────────────────────────
+  let audioCtx;
+  function getAC() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+  }
+  function playLineClear(count) {
+    const ac = getAC();
+    const t  = ac.currentTime;
+    for (let i = 0; i < Math.min(count, 4); i++) {
+      const osc  = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.connect(gain); gain.connect(ac.destination);
+      const freq = 330 * Math.pow(1.5, i);
+      osc.frequency.setValueAtTime(freq, t + i * 0.08);
+      osc.frequency.exponentialRampToValueAtTime(freq * 2, t + i * 0.08 + 0.15);
+      gain.gain.setValueAtTime(0.28, t + i * 0.08);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + i * 0.08 + 0.28);
+      osc.start(t + i * 0.08);
+      osc.stop(t + i * 0.08 + 0.3);
+    }
+  }
 
   // ── Tetrominos ─────────────────────────────────────────────────────────────
   const TETROS = [
@@ -67,11 +89,17 @@
   ];
 
   // ── State ──────────────────────────────────────────────────────────────────
-  let world;       // world[wc][row] = color string | null
-  let scrollX;     // total pixels scrolled (0 .. WORLD_COLS*B, wraps)
+  let world;
+  let scrollX;
   let scrollSpeed;
   let piece;       // { shape, color, pixelY, vy }
+  let pieceSC;     // piece screen column
   let score, level, animFrame, gameState;
+  let clearAnim;   // null | { rows, timer }
+
+  // Space hold tracking
+  let spaceHoldTimer = null;
+  let spaceDown      = false;
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   function rotateCW(s) {
@@ -83,23 +111,29 @@
     return out;
   }
 
-  // Screen column → world column given current scrollX
   function toWC(sc) {
     const colOff = Math.floor(scrollX / B) % WORLD_COLS;
     return ((colOff + sc) % WORLD_COLS + WORLD_COLS) % WORLD_COLS;
   }
 
-  // Does piece shape at given pixelY collide with world blocks or the floor?
   function collides(shape, pixelY) {
     for (let dy = 0; dy < shape.length; dy++)
       for (let dx = 0; dx < shape[0].length; dx++) {
         if (!shape[dy][dx]) continue;
         const row = Math.floor((pixelY + dy * B) / B);
-        if (row >= ROWS) return true;        // below canvas
-        if (row < 0)     continue;           // above canvas – skip
-        if (world[toWC(PIECE_COL + dx)][row]) return true;
+        if (row >= ROWS) return true;
+        if (row < 0)     continue;
+        if (world[toWC(pieceSC + dx)][row]) return true;
       }
     return false;
+  }
+
+  // Compute ghost landing y (snapped to grid, clamped to canvas)
+  function ghostY() {
+    let gy = piece.pixelY;
+    while (!collides(piece.shape, gy + 1) && gy < ROWS * B) gy++;
+    // Snap to nearest row boundary so ghost sits on a full grid row
+    return Math.floor(gy / B) * B;
   }
 
   function spawnPiece() {
@@ -107,6 +141,7 @@
     const rots = Math.floor(Math.random() * 4);
     let s = t.shape.map(r => [...r]);
     for (let i = 0; i < rots; i++) s = rotateCW(s);
+    pieceSC = Math.floor((VIS_COLS - s[0].length) / 2);
     return { shape: s, color: t.color, pixelY: -B * (s.length + 2), vy: 1 };
   }
 
@@ -118,19 +153,47 @@
         if (!sh[dy][dx]) continue;
         const row = Math.floor((piece.pixelY + dy * B) / B);
         if (row >= 0 && row < ROWS)
-          world[toWC(PIECE_COL + dx)][row] = piece.color;
-        if (row >= 0 && row <= 2) tooHigh = true;  // landed too high
+          world[toWC(pieceSC + dx)][row] = piece.color;
+        if (row >= 0 && row <= 2) tooHigh = true;
       }
-    score += 10;
-    updateHUD();
     if (tooHigh) { gameState = 'gameover'; return; }
-    piece = spawnPiece();
+
+    // Check full rows
+    const fullRows = [];
+    for (let r = 0; r < ROWS; r++) {
+      let full = true;
+      for (let wc = 0; wc < WORLD_COLS; wc++) {
+        if (!world[wc][r]) { full = false; break; }
+      }
+      if (full) fullRows.push(r);
+    }
+
+    if (fullRows.length > 0) {
+      score += fullRows.length * 100;
+      updateHUD();
+      playLineClear(fullRows.length);
+      clearAnim = { rows: fullRows, timer: 36 };
+    } else {
+      score += 10;
+      updateHUD();
+      piece = spawnPiece();
+    }
+  }
+
+  function clearFullRows(rows) {
+    const rowSet = new Set(rows);
+    for (let wc = 0; wc < WORLD_COLS; wc++) {
+      const newCol = new Array(ROWS).fill(null);
+      let writeRow = ROWS - 1;
+      for (let row = ROWS - 1; row >= 0; row--) {
+        if (!rowSet.has(row)) newCol[writeRow--] = world[wc][row];
+      }
+      world[wc] = newCol;
+    }
   }
 
   function initWorld() {
     world = Array.from({length: WORLD_COLS}, () => new Array(ROWS).fill(null));
-    // Solid ground at the bottom row
-    for (let c = 0; c < WORLD_COLS; c++) world[c][ROWS-1] = '#1e3020';
   }
 
   function init() {
@@ -140,6 +203,7 @@
     score       = 0;
     level       = 1;
     animFrame   = 0;
+    clearAnim   = null;
     piece       = spawnPiece();
     gameState   = 'start';
     updateHUD();
@@ -155,10 +219,18 @@
     if (gameState !== 'playing') return;
     animFrame++;
 
-    // Scroll world left (wraps)
+    if (clearAnim) {
+      clearAnim.timer--;
+      if (clearAnim.timer <= 0) {
+        clearFullRows(clearAnim.rows);
+        clearAnim = null;
+        piece = spawnPiece();
+      }
+      return;
+    }
+
     scrollX = (scrollX + scrollSpeed) % (WORLD_COLS * B);
 
-    // Difficulty ramp
     const newLvl = 1 + Math.floor(score / 150);
     if (newLvl !== level) {
       level       = newLvl;
@@ -166,33 +238,27 @@
       updateHUD();
     }
 
-    // Score trickle
     if (animFrame % 60 === 0) { score++; updateHUD(); }
 
-    // Piece physics
     piece.vy += GRAVITY;
     const nextY = piece.pixelY + piece.vy;
 
     if (collides(piece.shape, nextY)) {
-      // Find exact landing position (step down 1 px at a time from current Y)
       while (!collides(piece.shape, piece.pixelY + 1) && piece.pixelY < ROWS * B)
         piece.pixelY++;
       piece.vy = 0;
       lockPiece();
+      return;
     } else {
       piece.pixelY = nextY;
     }
 
-    // Ceiling clamp (prevent flying too far above screen)
     if (piece.vy < 0 && piece.pixelY < -piece.shape.length * B * 5) {
       piece.pixelY = -piece.shape.length * B * 5;
       piece.vy     = 0;
     }
 
-    // Detect if scrolling floor moved a block into the active piece
-    if (gameState === 'playing'
-        && piece.pixelY + piece.shape.length * B > 0
-        && collides(piece.shape, piece.pixelY)) {
+    if (piece.pixelY + piece.shape.length * B > 0 && collides(piece.shape, piece.pixelY)) {
       gameState = 'gameover';
     }
   }
@@ -213,8 +279,7 @@
 
   function panelRect(x, y, w, h, r) {
     ctx.beginPath();
-    ctx.moveTo(x+r, y);
-    ctx.lineTo(x+w-r, y);
+    ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y);
     ctx.arcTo(x+w, y,   x+w, y+r,   r);
     ctx.lineTo(x+w, y+h-r);
     ctx.arcTo(x+w, y+h, x+w-r, y+h, r);
@@ -226,64 +291,64 @@
   }
 
   function draw() {
-    // Background
     const bg = ctx.createLinearGradient(0, 0, 0, canvas.height);
     bg.addColorStop(0, '#080b10');
     bg.addColorStop(1, '#0f1620');
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Grid lines
     ctx.strokeStyle = 'rgba(255,255,255,0.025)';
     ctx.lineWidth = 1;
     for (let r = 0; r < ROWS; r++)
       for (let c = 0; c < VIS_COLS; c++)
         ctx.strokeRect(c*B, r*B, B, B);
 
-    // ── Scrolling world floor ──
+    const flashRows = new Set();
+    if (clearAnim && Math.floor(clearAnim.timer / 6) % 2 === 0)
+      clearAnim.rows.forEach(r => flashRows.add(r));
+
     const pixOff = scrollX % B;
     const colOff = Math.floor(scrollX / B) % WORLD_COLS;
     for (let sc = -1; sc <= VIS_COLS; sc++) {
       const wc = ((colOff + sc) % WORLD_COLS + WORLD_COLS) % WORLD_COLS;
       const sx = sc * B - pixOff;
       if (sx > canvas.width + B || sx < -B) continue;
-      for (let row = 0; row < ROWS; row++)
-        if (world[wc][row]) drawBlock(sx, row * B, world[wc][row]);
+      for (let row = 0; row < ROWS; row++) {
+        if (!world[wc][row]) continue;
+        drawBlock(sx, row * B, flashRows.has(row) ? '#ffffff' : world[wc][row],
+                  flashRows.has(row) ? 0.9 : 1);
+      }
     }
 
-    // ── Ghost (landing preview) ──
-    if (gameState === 'playing' && piece && piece.pixelY + piece.shape.length * B > 0) {
-      let ghostY = piece.pixelY;
-      while (!collides(piece.shape, ghostY + 1) && ghostY < ROWS * B) ghostY++;
-      const px = PIECE_COL * B;
+    // Ghost
+    if (gameState === 'playing' && piece && !clearAnim && piece.pixelY + piece.shape.length * B > 0) {
+      const gy = ghostY();
+      const px = pieceSC * B;
       for (let dy = 0; dy < piece.shape.length; dy++)
         for (let dx = 0; dx < piece.shape[0].length; dx++)
-          if (piece.shape[dy][dx])
-            drawBlock(px + dx*B, ghostY + dy*B, piece.color, 0.18);
+          if (piece.shape[dy][dx] && gy + dy * B < ROWS * B)
+            drawBlock(px + dx*B, gy + dy*B, piece.color, 0.22);
     }
 
-    // ── Active piece ──
-    if (gameState !== 'start' && piece) {
-      const px = PIECE_COL * B;
-      // Glow halo
+    // Active piece
+    if (gameState !== 'start' && piece && !clearAnim) {
+      const px = pieceSC * B;
       ctx.save();
       ctx.shadowColor = piece.color;
       ctx.shadowBlur  = 14;
       for (let dy = 0; dy < piece.shape.length; dy++)
         for (let dx = 0; dx < piece.shape[0].length; dx++)
           if (piece.shape[dy][dx]) {
-            ctx.fillStyle   = piece.color + '55';
+            ctx.fillStyle = piece.color + '55';
             ctx.fillRect(px + dx*B + 1, piece.pixelY + dy*B + 1, B-2, B-2);
           }
       ctx.restore();
-      // Solid blocks
       for (let dy = 0; dy < piece.shape.length; dy++)
         for (let dx = 0; dx < piece.shape[0].length; dx++)
           if (piece.shape[dy][dx])
             drawBlock(px + dx*B, piece.pixelY + dy*B, piece.color);
     }
 
-    // ── Scroll direction arrow ──
     if (gameState === 'playing') {
       ctx.fillStyle = 'rgba(255,255,255,0.12)';
       ctx.font      = "11px 'Courier New'";
@@ -291,33 +356,32 @@
       ctx.fillText('◀ scroll', canvas.width - 6, 14);
     }
 
-    // ── Overlays ──
     if (gameState === 'start')
       drawOverlay('FLAPPY TETRIS',
-        ['A Tetris piece falls from above.',
+        ['SPACE kısa bas = 1 kare yukarı + döndür',
+         'SPACE basılı tut = gölgeye indir',
+         '↓ = Anında aşağı indir',
          '',
-         'SPACE = Flap up + Rotate piece',
-         'Without SPACE it falls straight down.',
+         'Zemin sola kayar ve döner!',
+         'Dolu satır = Tetris temizleme!',
          '',
-         'The floor scrolls LEFT continuously',
-         'and wraps around (360°).',
-         '',
-         'Survive as long as you can!'],
-        '[ SPACE or CLICK to start ]', '#00cfff');
+         'Olabildiğince uzun hayatta kal!'],
+        '[ SPACE veya CLICK ile başla ]', '#00cfff');
 
     if (gameState === 'gameover')
       drawOverlay('GAME OVER',
-        [`Score:  ${score}`, `Level:  ${level}`],
-        '[ SPACE or CLICK to restart ]', '#ff1744');
+        [`Skor:   ${score}`, `Seviye: ${level}`],
+        '[ SPACE veya CLICK ile yeniden başla ]', '#ff1744');
   }
 
   function drawOverlay(title, lines, hint, titleColor) {
     ctx.fillStyle = 'rgba(8,11,16,0.86)';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    const pw = 320, ph = lines.length * 22 + 160;
-    const px = (canvas.width  - pw) / 2;
-    const py = canvas.height  / 2 - ph / 2;
+    const pw = canvas.width - 20;
+    const ph = lines.length * 22 + 160;
+    const px = 10;
+    const py = canvas.height / 2 - ph / 2;
 
     ctx.fillStyle   = 'rgba(16,22,30,0.97)';
     ctx.strokeStyle = '#30363d';
@@ -326,16 +390,16 @@
     ctx.fill(); ctx.stroke();
 
     ctx.textAlign = 'center';
-    ctx.font      = "bold 26px 'Courier New'";
+    ctx.font      = "bold 24px 'Courier New'";
     ctx.fillStyle = titleColor;
     ctx.fillText(title, canvas.width / 2, py + 46);
 
-    ctx.font      = "12px 'Courier New'";
+    ctx.font      = "11px 'Courier New'";
     ctx.fillStyle = '#8b949e';
     lines.forEach((l, i) => ctx.fillText(l, canvas.width / 2, py + 84 + i * 22));
 
     if (Math.floor(Date.now() / 500) % 2 === 0) {
-      ctx.font      = "bold 12px 'Courier New'";
+      ctx.font      = "bold 11px 'Courier New'";
       ctx.fillStyle = '#fdd835';
       ctx.fillText(hint, canvas.width / 2, py + ph - 20);
     }
@@ -345,23 +409,68 @@
   function loop() { update(); draw(); requestAnimationFrame(loop); }
 
   // ── Input ──────────────────────────────────────────────────────────────────
-  function flap() {
-    if (gameState === 'playing') {
-      piece.vy    = FLAP_V;
-      piece.shape = rotateCW(piece.shape);
-    } else {
-      init();
-      gameState = 'playing';
+  function startGame() { init(); gameState = 'playing'; }
+
+  function tapUp() {
+    // Move 1 block up + rotate
+    if (gameState !== 'playing' || clearAnim) return;
+    piece.pixelY -= B;
+    piece.vy      = 0;
+    piece.shape   = rotateCW(piece.shape);
+    const maxSC = VIS_COLS - piece.shape[0].length;
+    if (pieceSC > maxSC) pieceSC = maxSC;
+    if (pieceSC < 0)     pieceSC = 0;
+  }
+
+  function hardDrop() {
+    if (gameState !== 'playing' || clearAnim) return;
+    // Drop to current ghost position
+    piece.pixelY = ghostY();
+    piece.vy     = 0;
+    lockPiece();
+  }
+
+  // Space: short press = 1 up + rotate, hold = hard drop to ghost
+  function onSpaceDown() {
+    if (gameState !== 'playing') { startGame(); return; }
+    if (spaceDown) return;
+    spaceDown = true;
+    tapUp();
+    spaceHoldTimer = setTimeout(() => {
+      spaceHoldTimer = null;
+      hardDrop();
+    }, HOLD_MS);
+  }
+
+  function onSpaceUp() {
+    spaceDown = false;
+    if (spaceHoldTimer !== null) {
+      clearTimeout(spaceHoldTimer);
+      spaceHoldTimer = null;
+      // Short tap: piece already moved up, let gravity handle the rest
     }
   }
 
+  function clickAction() {
+    if (gameState !== 'playing') { startGame(); return; }
+    if (clearAnim) return;
+    // Click = jump 2 blocks up
+    piece.pixelY -= 2 * B;
+    piece.vy = 0;
+  }
+
   document.addEventListener('keydown', e => {
-    if (e.key === ' ') { e.preventDefault(); flap(); }
+    if (e.key === ' ')         { e.preventDefault(); onSpaceDown(); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); hardDrop(); }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); tapUp(); }
   });
-  canvas.addEventListener('click', flap);
-  canvas.addEventListener('touchstart', e => {
-    e.preventDefault(); flap();
-  }, { passive: false });
+
+  document.addEventListener('keyup', e => {
+    if (e.key === ' ') onSpaceUp();
+  });
+
+  canvas.addEventListener('click', clickAction);
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); clickAction(); }, { passive: false });
 
   // ── Boot ───────────────────────────────────────────────────────────────────
   init();
