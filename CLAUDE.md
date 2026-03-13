@@ -21,6 +21,20 @@ The game uses a circular-world model:
 - **Landing**: step `pixelY` down 1 px at a time until `collides` is true, then call `lockPiece()` which writes blocks into the world grid.
 - **Game over**: piece lands in row ≤ 2, or a scrolling world column moves a block into the piece's current position.
 
+## Git & GitHub Workflow
+
+Her kod değişikliğinin ardından şu adımlar **zorunludur**:
+
+1. Değiştirilen dosyaları `git add` ile stage'e al (`.claude/` dizinini ekleme).
+2. Anlamlı bir commit mesajı yaz:
+   - **Başlık**: `<tip>: <ne yapıldı>` formatında, 72 karakteri geçmez.
+     - Tipler: `feat` (yeni özellik), `fix` (hata düzeltme), `refactor`, `docs`, `chore`
+   - **Gövde**: Neden yapıldığını ve ne değiştiğini maddeler hâlinde açıkla.
+   - Son satır: `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>`
+3. `git push origin main` ile GitHub'a gönder.
+
+Kullanıcı "commit at" veya "push et" demese bile, anlamlı bir değişiklik tamamlandığında yukarıdaki adımları otomatik olarak uygula.
+
 ### Oyun Mantığı (Türkçe Özet)
 
 - Ekran sabit, dünya yatay kayan dairesel bir ızgara (`world[wc][row]`).
