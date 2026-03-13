@@ -36,7 +36,7 @@
     <span>Score: <b id="scoreEl">0</b></span>
     <span>Level: <b id="levelEl">1</b></span>
   </div>
-  <div id="controls">SPACE basılı tut = yukarı çık + döndür &nbsp;·&nbsp; SPACE bırak = düş &nbsp;·&nbsp; tekrar SPACE = gölgeye yerleş</div>
+  <div id="controls">SPACE tek = 1 yukarı &nbsp;·&nbsp; SPACE basılı tut = yerinde döndür &nbsp;·&nbsp; SPACE çift = gölgeye yerleş</div>
 
   <script>
   const canvas = document.getElementById('gameCanvas');
@@ -47,8 +47,10 @@
   const VIS_COLS    = 10;
   const ROWS        = 20;
   const WORLD_COLS  = VIS_COLS;
-  const BASE_SCROLL = 0.6;
-  const STEP_MS     = 500;   // ms per cell (both rise and fall)
+  const BASE_SCROLL       = 0.6;
+  const STEP_MS           = 500;   // ms per cell (fall) and rotation interval
+  const HOLD_THRESHOLD_MS = 200;   // press longer than this → hold mode (rotate)
+  const DOUBLE_TAP_MS     = 300;   // two presses within this → hard drop
 
   canvas.width  = VIS_COLS * B;   // 300
   canvas.height = ROWS * B;       // 600
@@ -97,10 +99,12 @@
   let clearAnim;   // null | { rows, timer }
 
   // Step-based movement intervals
-  let holdInterval = null;   // rise interval (space held)
-  let fallInterval = null;   // fall interval (space released)
-  let spaceDown    = false;
-  let hasRisen     = false;  // true after piece has risen at least once (enables lock-on-press)
+  let holdInterval   = null;   // rotation interval (space held)
+  let holdTimer      = null;   // setTimeout to activate hold mode
+  let fallInterval   = null;   // fall interval
+  let spaceDown      = false;
+  let holdActivated  = false;  // true if current press crossed HOLD_THRESHOLD_MS
+  let lastSpaceDown  = 0;      // timestamp of previous keydown (for double-tap)
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   function rotateCW(s) {
@@ -138,7 +142,6 @@
   }
 
   function spawnPiece() {
-    hasRisen = false;
     const t    = TETROS[Math.floor(Math.random() * TETROS.length)];
     const rots = Math.floor(Math.random() * 4);
     let s = t.shape.map(r => [...r]);
@@ -158,7 +161,7 @@
           world[toWC(pieceSC + dx)][row] = piece.color;
         if (row >= 0 && row <= 2) tooHigh = true;
       }
-    if (tooHigh) { stopFalling(); stopRising(); gameState = 'gameover'; return; }
+    if (tooHigh) { stopFalling(); stopRotating(); gameState = 'gameover'; return; }
 
     // Check full rows
     const fullRows = [];
@@ -246,7 +249,7 @@
 
     // Scroll-based collision: world moved into piece's current position
     if (piece.pixelY + piece.shape.length * B > 0 && collides(piece.shape, piece.pixelY)) {
-      stopFalling(); stopRising();
+      stopFalling(); stopRotating();
       gameState = 'gameover';
     }
   }
@@ -346,9 +349,9 @@
 
     if (gameState === 'start')
       drawOverlay('FLAPPY TETRIS',
-        ['SPACE basılı tut = her 0.5sn\'de 1 yukarı + döndür',
-         'SPACE bırak = her 0.5sn\'de 1 aşağı düş',
-         'Tekrar SPACE = gölgeye anında yerleş',
+        ['SPACE tek bas = 1 kare yukarı',
+         'SPACE basılı tut = yerinde döndür (0.5sn\'de bir)',
+         'SPACE çift bas = gölgeye anında yerleş',
          '↓ = Anında aşağı indir',
          '',
          'Zemin sola kayar ve döner!',
@@ -417,51 +420,66 @@
     if (fallInterval) { clearInterval(fallInterval); fallInterval = null; }
   }
 
-  function startRising() {
-    stopRising();
+  function startRotating() {
+    stopRotating();
     holdInterval = setInterval(() => {
       if (gameState !== 'playing' || clearAnim) return;
-      hasRisen = true;
       piece.shape = rotateCW(piece.shape);
       const maxSC = VIS_COLS - piece.shape[0].length;
       if (pieceSC > maxSC) pieceSC = maxSC;
       if (pieceSC < 0) pieceSC = 0;
-      piece.pixelY -= B;
+      // pixelY unchanged — stays in the same row
     }, STEP_MS);
   }
 
-  function stopRising() {
+  function stopRotating() {
     if (holdInterval) { clearInterval(holdInterval); holdInterval = null; }
+  }
+
+  function moveUpOne() {
+    if (gameState !== 'playing' || clearAnim) return;
+    piece.pixelY -= B;
   }
 
   function hardDrop() {
     if (gameState !== 'playing' || clearAnim) return;
-    stopFalling(); stopRising();
+    stopFalling(); stopRotating();
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
     piece.pixelY = ghostY();
     lockPiece();
   }
 
-  // Space held → rise every 500ms; released → fall every 500ms
-  // Tap space while falling (after having risen at least once) → lock at ghost
+  // Single tap  → move up 1 row (on keyup, if not hold mode)
+  // Hold        → rotate in place every 500ms (no vertical movement)
+  // Double tap  → hard drop to ghost
   function onSpaceDown() {
     if (gameState !== 'playing') { startGame(); return; }
     if (spaceDown) return;
     spaceDown = true;
-    if (fallInterval && hasRisen) {
-      // Second press while falling: lock immediately
+
+    const now = Date.now();
+    if (now - lastSpaceDown < DOUBLE_TAP_MS) {
+      lastSpaceDown = 0;   // reset so a third tap isn't also a double
       hardDrop();
-    } else {
-      // First press: switch to rising
-      stopFalling();
-      startRising();
+      return;
     }
+    lastSpaceDown = now;
+    holdActivated = false;
+
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      holdActivated = true;
+      startRotating();
+    }, HOLD_THRESHOLD_MS);
   }
 
   function onSpaceUp() {
     if (!spaceDown) return;
     spaceDown = false;
-    stopRising();
-    if (gameState === 'playing') startFalling();
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    stopRotating();
+    if (!holdActivated && gameState === 'playing') moveUpOne();
+    holdActivated = false;
   }
 
   function clickAction() {
