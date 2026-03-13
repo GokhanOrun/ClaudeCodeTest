@@ -482,10 +482,6 @@
     holdActivated = false;
   }
 
-  function clickAction() {
-    if (gameState !== 'playing') { startGame(); return; }
-  }
-
   document.addEventListener('keydown', e => {
     if (e.key === ' ')         { e.preventDefault(); onSpaceDown(); }
     if (e.key === 'ArrowDown') { e.preventDefault(); hardDrop(); }
@@ -495,8 +491,10 @@
     if (e.key === ' ') onSpaceUp();
   });
 
-  canvas.addEventListener('click', clickAction);
-  canvas.addEventListener('touchstart', e => { e.preventDefault(); clickAction(); }, { passive: false });
+  canvas.addEventListener('mousedown',  e => { e.preventDefault(); onSpaceDown(); });
+  canvas.addEventListener('mouseup',    e => { e.preventDefault(); onSpaceUp(); });
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); onSpaceDown(); }, { passive: false });
+  canvas.addEventListener('touchend',   e => { e.preventDefault(); onSpaceUp(); },   { passive: false });
 
   // ── Boot ───────────────────────────────────────────────────────────────────
   init();
